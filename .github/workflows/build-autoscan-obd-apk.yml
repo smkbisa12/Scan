@@ -1,1 +1,800 @@
 
+name: Build AutoScan OBD APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.9'
+          cache-provider: basic
+
+      - name: Create Android project
+        shell: bash
+        run: |
+          cat > settings.gradle <<'AUTOSCAN_EOF_SETTINGS_GRADLE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'AutoScanOBD'
+          include ':app'
+          AUTOSCAN_EOF_SETTINGS_GRADLE
+
+          cat > build.gradle <<'AUTOSCAN_EOF_BUILD_GRADLE'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          AUTOSCAN_EOF_BUILD_GRADLE
+
+          mkdir -p app
+          cat > app/build.gradle <<'AUTOSCAN_EOF_APP_BUILD_GRADLE'
+          plugins { id 'com.android.application' }
+          
+          android {
+              namespace 'com.autoscan.obd'
+              compileSdk 35
+          
+              defaultConfig {
+                  applicationId 'com.autoscan.obd'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0.0'
+              }
+          }
+          AUTOSCAN_EOF_APP_BUILD_GRADLE
+
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'AUTOSCAN_EOF_APP_SRC_MAIN_ANDROIDMANIFEST_XML'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+          
+              <uses-feature android:name="android.hardware.bluetooth" android:required="true" />
+          
+              <application
+                  android:allowBackup="false"
+                  android:usesCleartextTraffic="false"
+                  android:theme="@style/AppTheme"
+                  android:label="AutoScan OBD"
+                  android:icon="@drawable/ic_launcher">
+                  <activity
+                      android:name=".MainActivity"
+                      android:screenOrientation="portrait"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          AUTOSCAN_EOF_APP_SRC_MAIN_ANDROIDMANIFEST_XML
+
+          mkdir -p app/src/main/java/com/autoscan/obd
+          cat > app/src/main/java/com/autoscan/obd/MainActivity.java <<'AUTOSCAN_EOF_APP_SRC_MAIN_JAVA_COM_AUTOSCAN_OBD_MAINACTIVITY_JAVA'
+          package com.autoscan.obd;
+          
+          import android.Manifest;
+          import android.app.Activity;
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothDevice;
+          import android.bluetooth.BluetoothSocket;
+          import android.content.pm.PackageManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.View;
+          import android.widget.ArrayAdapter;
+          import android.widget.Button;
+          import android.widget.Spinner;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          
+          import java.io.BufferedWriter;
+          import java.io.File;
+          import java.io.FileWriter;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Date;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Set;
+          import java.util.UUID;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.atomic.AtomicBoolean;
+          
+          public class MainActivity extends Activity {
+              private static final int REQ_BT = 1001;
+              private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
+          
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private final ExecutorService io = Executors.newSingleThreadExecutor();
+              private final List<BluetoothDevice> devices = new ArrayList<>();
+              private final AtomicBoolean polling = new AtomicBoolean(false);
+          
+              private BluetoothAdapter bluetoothAdapter;
+              private BluetoothSocket socket;
+              private InputStream in;
+              private OutputStream out;
+              private BufferedWriter logWriter;
+              private boolean logging = false;
+          
+              private Spinner deviceSpinner;
+              private TextView statusText, rpmText, speedText, coolantText, loadText, voltageText, dtcText, logPathText;
+              private Button connectButton, refreshButton, readDtcButton, clearDtcButton, logButton;
+          
+              private String lastRpm = "", lastSpeed = "", lastCoolant = "", lastLoad = "", lastVoltage = "";
+          
+              @Override protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  setContentView(R.layout.activity_main);
+          
+                  bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+                  bindViews();
+                  wireEvents();
+                  ensurePermissions();
+              }
+          
+              private void bindViews() {
+                  deviceSpinner = findViewById(R.id.deviceSpinner);
+                  statusText = findViewById(R.id.statusText);
+                  rpmText = findViewById(R.id.rpmText);
+                  speedText = findViewById(R.id.speedText);
+                  coolantText = findViewById(R.id.coolantText);
+                  loadText = findViewById(R.id.loadText);
+                  voltageText = findViewById(R.id.voltageText);
+                  dtcText = findViewById(R.id.dtcText);
+                  logPathText = findViewById(R.id.logPathText);
+                  connectButton = findViewById(R.id.connectButton);
+                  refreshButton = findViewById(R.id.refreshButton);
+                  readDtcButton = findViewById(R.id.readDtcButton);
+                  clearDtcButton = findViewById(R.id.clearDtcButton);
+                  logButton = findViewById(R.id.logButton);
+              }
+          
+              private void wireEvents() {
+                  refreshButton.setOnClickListener(v -> loadPairedDevices());
+                  connectButton.setOnClickListener(v -> {
+                      if (socket != null && socket.isConnected()) disconnect(); else connectSelected();
+                  });
+                  readDtcButton.setOnClickListener(v -> readDtc());
+                  clearDtcButton.setOnClickListener(v -> clearDtc());
+                  logButton.setOnClickListener(v -> toggleLogging());
+              }
+          
+              private void ensurePermissions() {
+                  if (bluetoothAdapter == null) {
+                      setStatus("Bluetooth tidak tersedia di perangkat ini");
+                      return;
+                  }
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      List<String> needed = new ArrayList<>();
+                      if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) needed.add(Manifest.permission.BLUETOOTH_CONNECT);
+                      if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) needed.add(Manifest.permission.BLUETOOTH_SCAN);
+                      if (!needed.isEmpty()) {
+                          requestPermissions(needed.toArray(new String[0]), REQ_BT);
+                          return;
+                      }
+                  } else if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, REQ_BT);
+                      return;
+                  }
+                  loadPairedDevices();
+              }
+          
+              @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == REQ_BT) loadPairedDevices();
+              }
+          
+              private void loadPairedDevices() {
+                  if (!hasBtPermission()) return;
+                  devices.clear();
+                  List<String> labels = new ArrayList<>();
+                  try {
+                      Set<BluetoothDevice> bonded = bluetoothAdapter.getBondedDevices();
+                      for (BluetoothDevice d : bonded) {
+                          devices.add(d);
+                          labels.add((d.getName() == null ? "Unknown" : d.getName()) + "\n" + d.getAddress());
+                      }
+                  } catch (SecurityException e) {
+                      setStatus("Izin Bluetooth belum diberikan");
+                  }
+                  if (labels.isEmpty()) labels.add("Belum ada adapter paired. Pair ELM327 di Settings Bluetooth dulu.");
+                  ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, labels);
+                  deviceSpinner.setAdapter(adapter);
+                  setStatus(devices.isEmpty() ? "Pair adapter ELM327 terlebih dahulu" : "Pilih adapter lalu Connect");
+              }
+          
+              private boolean hasBtPermission() {
+                  if (Build.VERSION.SDK_INT >= 31) return checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+                  return true;
+              }
+          
+              private void connectSelected() {
+                  if (devices.isEmpty()) { toast("Tidak ada adapter paired"); return; }
+                  BluetoothDevice device = devices.get(deviceSpinner.getSelectedItemPosition());
+                  io.execute(() -> {
+                      try {
+                          setStatus("Menghubungkan ke " + safeName(device) + "...");
+                          if (!hasBtPermission()) return;
+                          socket = device.createRfcommSocketToServiceRecord(SPP_UUID);
+                          socket.connect();
+                          in = socket.getInputStream();
+                          out = socket.getOutputStream();
+                          initElm327();
+                          ui.post(() -> connectButton.setText("Disconnect"));
+                          setStatus("Terhubung: " + safeName(device));
+                          startPolling();
+                      } catch (Exception e) {
+                          disconnectSilently();
+                          setStatus("Gagal konek: " + e.getMessage());
+                      }
+                  });
+              }
+          
+              private String safeName(BluetoothDevice device) {
+                  try { return device.getName() == null ? device.getAddress() : device.getName(); }
+                  catch (SecurityException e) { return "adapter"; }
+              }
+          
+              private void initElm327() throws IOException, InterruptedException {
+                  sendCommand("ATZ", 1200);
+                  sendCommand("ATE0", 200);
+                  sendCommand("ATL0", 200);
+                  sendCommand("ATS0", 200);
+                  sendCommand("ATH0", 200);
+                  sendCommand("ATSP0", 800);
+                  sendCommand("0100", 300);
+              }
+          
+              private void startPolling() {
+                  polling.set(true);
+                  io.execute(() -> {
+                      while (polling.get() && socket != null && socket.isConnected()) {
+                          try {
+                              lastRpm = parseRpm(sendCommand("010C", 160));
+                              lastSpeed = parseByteValue(sendCommand("010D", 140), "0D", 1, false);
+                              lastCoolant = parseByteValue(sendCommand("0105", 140), "05", 1, true);
+                              lastLoad = parseEngineLoad(sendCommand("0104", 140));
+                              lastVoltage = parseVoltage(sendCommand("ATRV", 140));
+          
+                              ui.post(() -> {
+                                  rpmText.setText(emptyDash(lastRpm));
+                                  speedText.setText(emptyDash(lastSpeed) + " km/h");
+                                  coolantText.setText(emptyDash(lastCoolant) + " °C");
+                                  loadText.setText(emptyDash(lastLoad) + " %");
+                                  voltageText.setText(emptyDash(lastVoltage) + " V");
+                              });
+                              writeLogLine();
+                              Thread.sleep(350);
+                          } catch (Exception e) {
+                              setStatus("Polling berhenti: " + e.getMessage());
+                              polling.set(false);
+                          }
+                      }
+                  });
+              }
+          
+              private String emptyDash(String s) { return s == null || s.isEmpty() ? "--" : s; }
+          
+              private synchronized String sendCommand(String cmd, long waitMs) throws IOException, InterruptedException {
+                  if (out == null || in == null) throw new IOException("Belum terhubung");
+                  drainInput();
+                  out.write((cmd + "\r").getBytes());
+                  out.flush();
+                  Thread.sleep(waitMs);
+                  StringBuilder sb = new StringBuilder();
+                  long end = System.currentTimeMillis() + 1200;
+                  while (System.currentTimeMillis() < end) {
+                      while (in.available() > 0) {
+                          int c = in.read();
+                          if (c == -1) break;
+                          char ch = (char) c;
+                          if (ch == '>') return clean(sb.toString());
+                          sb.append(ch);
+                      }
+                      Thread.sleep(20);
+                  }
+                  return clean(sb.toString());
+              }
+          
+              private void drainInput() throws IOException {
+                  if (in == null) return;
+                  while (in.available() > 0) in.read();
+              }
+          
+              private String clean(String raw) {
+                  return raw.replace("SEARCHING...", "")
+                          .replace("NO DATA", "")
+                          .replace("STOPPED", "")
+                          .replace("?", "")
+                          .replace("\r", "")
+                          .replace("\n", "")
+                          .replace(" ", "")
+                          .trim().toUpperCase(Locale.US);
+              }
+          
+              private String parseRpm(String response) {
+                  byte[] bytes = mode01Bytes(response, "0C");
+                  if (bytes.length < 2) return "";
+                  int rpm = ((bytes[0] & 0xFF) * 256 + (bytes[1] & 0xFF)) / 4;
+                  return String.valueOf(rpm);
+              }
+          
+              private String parseByteValue(String response, String pid, int byteCount, boolean coolantFormula) {
+                  byte[] bytes = mode01Bytes(response, pid);
+                  if (bytes.length < byteCount) return "";
+                  int v = bytes[0] & 0xFF;
+                  if (coolantFormula) v -= 40;
+                  return String.valueOf(v);
+              }
+          
+              private String parseEngineLoad(String response) {
+                  byte[] bytes = mode01Bytes(response, "04");
+                  if (bytes.length < 1) return "";
+                  int pct = Math.round((bytes[0] & 0xFF) * 100f / 255f);
+                  return String.valueOf(pct);
+              }
+          
+              private String parseVoltage(String response) {
+                  String v = response.replace("V", "");
+                  if (v.matches("[0-9.]+")) return v;
+                  return "";
+              }
+          
+              private byte[] mode01Bytes(String response, String pid) {
+                  int idx = response.indexOf("41" + pid);
+                  if (idx < 0) return new byte[0];
+                  String data = response.substring(idx + 4);
+                  int pairs = data.length() / 2;
+                  byte[] bytes = new byte[pairs];
+                  for (int i = 0; i < pairs; i++) {
+                      try { bytes[i] = (byte) Integer.parseInt(data.substring(i * 2, i * 2 + 2), 16); }
+                      catch (Exception e) { return new byte[0]; }
+                  }
+                  return bytes;
+              }
+          
+              private void readDtc() {
+                  io.execute(() -> {
+                      try {
+                          String r = sendCommand("03", 600);
+                          List<String> codes = parseDtc(r);
+                          ui.post(() -> dtcText.setText(codes.isEmpty() ? "Tidak ada DTC standar powertrain." : joinCodes(codes)));
+                      } catch (Exception e) {
+                          setStatus("Gagal baca DTC: " + e.getMessage());
+                      }
+                  });
+              }
+          
+              private void clearDtc() {
+                  io.execute(() -> {
+                      try {
+                          String r = sendCommand("04", 800);
+                          ui.post(() -> dtcText.setText("Perintah clear DTC dikirim. Respons: " + r));
+                      } catch (Exception e) {
+                          setStatus("Gagal clear DTC: " + e.getMessage());
+                      }
+                  });
+              }
+          
+              private List<String> parseDtc(String response) {
+                  List<String> outCodes = new ArrayList<>();
+                  int idx = response.indexOf("43");
+                  if (idx < 0) return outCodes;
+                  String data = response.substring(idx + 2);
+                  for (int i = 0; i + 4 <= data.length(); i += 4) {
+                      String pair = data.substring(i, i + 4);
+                      if (pair.equals("0000")) continue;
+                      try { outCodes.add(decodeDtc(Integer.parseInt(pair, 16))); }
+                      catch (Exception ignored) { }
+                  }
+                  return outCodes;
+              }
+          
+              private String decodeDtc(int raw) {
+                  char[] types = {'P', 'C', 'B', 'U'};
+                  char type = types[(raw & 0xC000) >> 14];
+                  int d1 = (raw & 0x3000) >> 12;
+                  int d2 = (raw & 0x0F00) >> 8;
+                  int d3 = (raw & 0x00F0) >> 4;
+                  int d4 = raw & 0x000F;
+                  return String.format(Locale.US, "%c%d%X%X%X", type, d1, d2, d3, d4);
+              }
+          
+              private String joinCodes(List<String> codes) {
+                  StringBuilder sb = new StringBuilder();
+                  for (String c : codes) sb.append(c).append('\n');
+                  return sb.toString().trim();
+              }
+          
+              private void toggleLogging() {
+                  if (!logging) {
+                      try {
+                          File dir = getExternalFilesDir("logs");
+                          if (dir != null && !dir.exists()) dir.mkdirs();
+                          String name = "obd_log_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".csv";
+                          File f = new File(dir, name);
+                          logWriter = new BufferedWriter(new FileWriter(f));
+                          logWriter.write("time,rpm,speed_kmh,coolant_c,load_pct,voltage_v\n");
+                          logging = true;
+                          logButton.setText("Stop CSV Log");
+                          logPathText.setText("Log: " + f.getAbsolutePath());
+                      } catch (Exception e) { toast("Gagal mulai log: " + e.getMessage()); }
+                  } else {
+                      stopLogging();
+                  }
+              }
+          
+              private void writeLogLine() {
+                  if (!logging || logWriter == null) return;
+                  try {
+                      String time = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(new Date());
+                      logWriter.write(time + "," + lastRpm + "," + lastSpeed + "," + lastCoolant + "," + lastLoad + "," + lastVoltage + "\n");
+                      logWriter.flush();
+                  } catch (Exception ignored) { }
+              }
+          
+              private void stopLogging() {
+                  try { if (logWriter != null) logWriter.close(); } catch (Exception ignored) {}
+                  logWriter = null;
+                  logging = false;
+                  logButton.setText("Start CSV Log");
+              }
+          
+              private void disconnect() {
+                  polling.set(false);
+                  stopLogging();
+                  disconnectSilently();
+                  connectButton.setText("Connect");
+                  setStatus("Terputus");
+              }
+          
+              private void disconnectSilently() {
+                  try { if (socket != null) socket.close(); } catch (Exception ignored) {}
+                  socket = null; in = null; out = null;
+              }
+          
+              private void setStatus(String s) { ui.post(() -> statusText.setText(s)); }
+              private void toast(String s) { ui.post(() -> Toast.makeText(this, s, Toast.LENGTH_SHORT).show()); }
+          
+              @Override protected void onDestroy() {
+                  polling.set(false);
+                  stopLogging();
+                  disconnectSilently();
+                  io.shutdownNow();
+                  super.onDestroy();
+              }
+          }
+          AUTOSCAN_EOF_APP_SRC_MAIN_JAVA_COM_AUTOSCAN_OBD_MAINACTIVITY_JAVA
+
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_main.xml <<'AUTOSCAN_EOF_APP_SRC_MAIN_RES_LAYOUT_ACTIVITY_MAIN_XML'
+          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:fillViewport="true"
+              android:background="@color/bg">
+          
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="vertical"
+                  android:padding="18dp">
+          
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="AutoScan OBD"
+                      android:textColor="@color/text_primary"
+                      android:textSize="28sp"
+                      android:textStyle="bold" />
+          
+                  <TextView
+                      android:id="@+id/statusText"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="4dp"
+                      android:text="Belum terhubung"
+                      android:textColor="@color/text_secondary"
+                      android:textSize="14sp" />
+          
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:background="@drawable/card_bg"
+                      android:orientation="vertical"
+                      android:padding="14dp">
+          
+                      <TextView
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:text="Adapter Bluetooth"
+                          android:textColor="@color/text_primary"
+                          android:textStyle="bold"
+                          android:textSize="16sp" />
+          
+                      <Spinner
+                          android:id="@+id/deviceSpinner"
+                          android:layout_width="match_parent"
+                          android:layout_height="48dp"
+                          android:layout_marginTop="10dp" />
+          
+                      <LinearLayout
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:orientation="horizontal"
+                          android:layout_marginTop="10dp">
+          
+                          <Button
+                              android:id="@+id/refreshButton"
+                              android:layout_width="0dp"
+                              android:layout_height="48dp"
+                              android:layout_weight="1"
+                              android:background="@drawable/button_bg"
+                              android:text="Refresh"
+                              android:textColor="#09100E" />
+          
+                          <Space android:layout_width="8dp" android:layout_height="1dp" />
+          
+                          <Button
+                              android:id="@+id/connectButton"
+                              android:layout_width="0dp"
+                              android:layout_height="48dp"
+                              android:layout_weight="1"
+                              android:background="@drawable/button_bg"
+                              android:text="Connect"
+                              android:textColor="#09100E" />
+                      </LinearLayout>
+                  </LinearLayout>
+          
+                  <GridLayout
+                      android:id="@+id/dashboardGrid"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:columnCount="2">
+          
+                      <LinearLayout style="@style/MetricCard">
+                          <TextView style="@style/MetricLabel" android:text="RPM" />
+                          <TextView android:id="@+id/rpmText" style="@style/MetricValue" android:text="--" />
+                      </LinearLayout>
+          
+                      <LinearLayout style="@style/MetricCard">
+                          <TextView style="@style/MetricLabel" android:text="Speed" />
+                          <TextView android:id="@+id/speedText" style="@style/MetricValue" android:text="-- km/h" />
+                      </LinearLayout>
+          
+                      <LinearLayout style="@style/MetricCard">
+                          <TextView style="@style/MetricLabel" android:text="Coolant" />
+                          <TextView android:id="@+id/coolantText" style="@style/MetricValue" android:text="-- °C" />
+                      </LinearLayout>
+          
+                      <LinearLayout style="@style/MetricCard">
+                          <TextView style="@style/MetricLabel" android:text="Load" />
+                          <TextView android:id="@+id/loadText" style="@style/MetricValue" android:text="-- %" />
+                      </LinearLayout>
+          
+                      <LinearLayout style="@style/MetricCardWide">
+                          <TextView style="@style/MetricLabel" android:text="Battery / Adapter Voltage" />
+                          <TextView android:id="@+id/voltageText" style="@style/MetricValue" android:text="-- V" />
+                      </LinearLayout>
+                  </GridLayout>
+          
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:background="@drawable/card_bg"
+                      android:orientation="vertical"
+                      android:padding="14dp">
+          
+                      <TextView
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:text="Diagnostic Trouble Codes"
+                          android:textColor="@color/text_primary"
+                          android:textStyle="bold"
+                          android:textSize="16sp" />
+          
+                      <TextView
+                          android:id="@+id/dtcText"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="10dp"
+                          android:minHeight="80dp"
+                          android:text="Belum dibaca"
+                          android:textColor="@color/text_secondary"
+                          android:textSize="14sp" />
+          
+                      <LinearLayout
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:orientation="horizontal">
+          
+                          <Button
+                              android:id="@+id/readDtcButton"
+                              android:layout_width="0dp"
+                              android:layout_height="48dp"
+                              android:layout_weight="1"
+                              android:background="@drawable/button_bg"
+                              android:text="Read DTC"
+                              android:textColor="#09100E" />
+          
+                          <Space android:layout_width="8dp" android:layout_height="1dp" />
+          
+                          <Button
+                              android:id="@+id/clearDtcButton"
+                              android:layout_width="0dp"
+                              android:layout_height="48dp"
+                              android:layout_weight="1"
+                              android:background="@drawable/button_danger_bg"
+                              android:text="Clear DTC"
+                              android:textColor="#FFFFFF" />
+                      </LinearLayout>
+                  </LinearLayout>
+          
+                  <Button
+                      android:id="@+id/logButton"
+                      android:layout_width="match_parent"
+                      android:layout_height="52dp"
+                      android:layout_marginTop="16dp"
+                      android:background="@drawable/button_bg"
+                      android:text="Start CSV Log"
+                      android:textColor="#09100E" />
+          
+                  <TextView
+                      android:id="@+id/logPathText"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:textColor="@color/text_secondary"
+                      android:textSize="12sp" />
+              </LinearLayout>
+          </ScrollView>
+          AUTOSCAN_EOF_APP_SRC_MAIN_RES_LAYOUT_ACTIVITY_MAIN_XML
+
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'AUTOSCAN_EOF_APP_SRC_MAIN_RES_VALUES_STRINGS_XML'
+          <resources>
+              <string name="app_name">AutoScan OBD</string>
+          </resources>
+          AUTOSCAN_EOF_APP_SRC_MAIN_RES_VALUES_STRINGS_XML
+
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/colors.xml <<'AUTOSCAN_EOF_APP_SRC_MAIN_RES_VALUES_COLORS_XML'
+          <resources>
+              <color name="bg">#0E1117</color>
+              <color name="panel">#171B22</color>
+              <color name="panel2">#202633</color>
+              <color name="text_primary">#F3F6FA</color>
+              <color name="text_secondary">#AAB4C3</color>
+              <color name="accent">#00C2A8</color>
+              <color name="danger">#FF5D5D</color>
+          </resources>
+          AUTOSCAN_EOF_APP_SRC_MAIN_RES_VALUES_COLORS_XML
+
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/styles.xml <<'AUTOSCAN_EOF_APP_SRC_MAIN_RES_VALUES_STYLES_XML'
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:windowNoTitle">true</item>
+                  <item name="android:windowActionBar">false</item>
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:colorAccent">@color/accent</item>
+              </style>
+          
+              <style name="MetricCard">
+                  <item name="android:layout_width">0dp</item>
+                  <item name="android:layout_height">105dp</item>
+                  <item name="android:layout_columnWeight">1</item>
+                  <item name="android:layout_margin">6dp</item>
+                  <item name="android:background">@drawable/card_bg</item>
+                  <item name="android:orientation">vertical</item>
+                  <item name="android:padding">14dp</item>
+              </style>
+              <style name="MetricCardWide">
+                  <item name="android:layout_width">match_parent</item>
+                  <item name="android:layout_height">105dp</item>
+                  <item name="android:layout_columnSpan">2</item>
+                  <item name="android:layout_margin">6dp</item>
+                  <item name="android:background">@drawable/card_bg</item>
+                  <item name="android:orientation">vertical</item>
+                  <item name="android:padding">14dp</item>
+              </style>
+              <style name="MetricLabel">
+                  <item name="android:layout_width">match_parent</item>
+                  <item name="android:layout_height">wrap_content</item>
+                  <item name="android:textColor">@color/text_secondary</item>
+                  <item name="android:textSize">13sp</item>
+              </style>
+              <style name="MetricValue">
+                  <item name="android:layout_width">match_parent</item>
+                  <item name="android:layout_height">wrap_content</item>
+                  <item name="android:layout_marginTop">8dp</item>
+                  <item name="android:textColor">@color/text_primary</item>
+                  <item name="android:textSize">26sp</item>
+                  <item name="android:textStyle">bold</item>
+              </style>
+          </resources>
+          AUTOSCAN_EOF_APP_SRC_MAIN_RES_VALUES_STYLES_XML
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/card_bg.xml <<'AUTOSCAN_EOF_APP_SRC_MAIN_RES_DRAWABLE_CARD_BG_XML'
+          <shape xmlns:android="http://schemas.android.com/apk/res/android">
+              <solid android:color="@color/panel" />
+              <corners android:radius="16dp" />
+              <stroke android:width="1dp" android:color="#2B3342" />
+          </shape>
+          AUTOSCAN_EOF_APP_SRC_MAIN_RES_DRAWABLE_CARD_BG_XML
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/button_bg.xml <<'AUTOSCAN_EOF_APP_SRC_MAIN_RES_DRAWABLE_BUTTON_BG_XML'
+          <selector xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:state_pressed="true">
+                  <shape><corners android:radius="12dp"/><solid android:color="#009984"/></shape>
+              </item>
+              <item>
+                  <shape><corners android:radius="12dp"/><solid android:color="@color/accent"/></shape>
+              </item>
+          </selector>
+          AUTOSCAN_EOF_APP_SRC_MAIN_RES_DRAWABLE_BUTTON_BG_XML
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/button_danger_bg.xml <<'AUTOSCAN_EOF_APP_SRC_MAIN_RES_DRAWABLE_BUTTON_DANGER_BG_XML'
+          <selector xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:state_pressed="true">
+                  <shape><corners android:radius="12dp"/><solid android:color="#D94B4B"/></shape>
+              </item>
+              <item>
+                  <shape><corners android:radius="12dp"/><solid android:color="@color/danger"/></shape>
+              </item>
+          </selector>
+          AUTOSCAN_EOF_APP_SRC_MAIN_RES_DRAWABLE_BUTTON_DANGER_BG_XML
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'AUTOSCAN_EOF_APP_SRC_MAIN_RES_DRAWABLE_IC_LAUNCHER_XML'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#0E1117" android:pathData="M0,0h108v108h-108z" />
+              <path android:fillColor="#00C2A8" android:pathData="M54,18a36,36 0,1 0,0.1,0M54,28a26,26 0,1 1,-0.1,0" />
+              <path android:fillColor="#F3F6FA" android:pathData="M50,35h8v28h-8zM37,67h34v8h-34z" />
+          </vector>
+          AUTOSCAN_EOF_APP_SRC_MAIN_RES_DRAWABLE_IC_LAUNCHER_XML
+
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoScanOBD-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
